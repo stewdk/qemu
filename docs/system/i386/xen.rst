@@ -102,9 +102,6 @@ This configuration can be achieved as follows:
        -drive file=${GUEST_IMAGE},if=xen \\
        -drive file=${GUEST_IMAGE},file.locking=off,if=ide
 
-VirtIO devices can also be used; Linux guests may need to be dissuaded from
-umplugging them by adding '``xen_emul_unplug=never``' on their command line.
-
 Booting Xen PV guests
 ---------------------
 
