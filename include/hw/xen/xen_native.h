@@ -537,6 +537,8 @@ static inline int xendevicemodel_set_irq_level(xendevicemodel_handle *dmod,
 #define GUEST_VIRTIO_MMIO_SIZE   xen_mk_ullong(0x00100000)
 #define GUEST_VIRTIO_MMIO_SPI_FIRST   33
 #define GUEST_VIRTIO_MMIO_SPI_LAST    43
+#define GUEST_VIRTIO_PCI_SPI_FIRST    44
+#define GUEST_VIRTIO_PCI_SPI_LAST     48
 #endif
 
 #if defined(__i386__) || defined(__x86_64__)

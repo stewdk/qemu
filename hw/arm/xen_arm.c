@@ -35,6 +35,7 @@
 #include "sysemu/tpm.h"
 #include "hw/xen/arch_hvm.h"
 #include "trace.h"
+#include "hw/pci-host/gpex.h"
 
 #define TYPE_XEN_ARM  MACHINE_TYPE_NAME("xenpvh")
 OBJECT_DECLARE_SIMPLE_TYPE(XenArmState, XEN_ARM)
@@ -58,6 +59,9 @@ struct XenArmState {
 
     struct {
         uint64_t tpm_base_addr;
+        MemMapEntry pcie_mmio;
+        MemMapEntry pcie_ecam;
+        MemMapEntry pcie_mmio_high;
     } cfg;
 };
 
@@ -130,6 +134,80 @@ static void xen_init_ram(MachineState *machine)
     ram_grants = *xen_init_grant_ram();
 }
 
+static bool xen_validate_pcie_config(XenArmState *xam)
+{
+    if (xam->cfg.pcie_ecam.base == 0 &&
+        xam->cfg.pcie_ecam.size == 0 &&
+        xam->cfg.pcie_mmio.base == 0 &&
+        xam->cfg.pcie_mmio.size == 0 &&
+        xam->cfg.pcie_mmio_high.base == 0 &&
+        xam->cfg.pcie_mmio_high.size == 0) {
+        /* It's okay, user just don't want PCIe brige */
+        return false;
+    }
+
+    if (xam->cfg.pcie_ecam.base == 0 ||
+        xam->cfg.pcie_ecam.size == 0 ||
+        xam->cfg.pcie_mmio.base == 0 ||
+        xam->cfg.pcie_mmio.size == 0 ||
+        xam->cfg.pcie_mmio_high.base == 0 ||
+        xam->cfg.pcie_mmio_high.size == 0) {
+        /* User provided some PCIe options, but not all of them */
+        error_printf("Incomplete PCIe bridge configuration\n");
+        exit(1);
+    }
+
+    return true;
+}
+
+static void xen_create_pcie(XenArmState *xam)
+{
+    MemoryRegion *mmio_alias, *mmio_alias_high, *mmio_reg;
+    MemoryRegion *ecam_alias, *ecam_reg;
+    DeviceState *dev;
+    int i;
+
+    dev = qdev_new(TYPE_GPEX_HOST);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+
+    /* Map ECAM space */
+    ecam_alias = g_new0(MemoryRegion, 1);
+    ecam_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+    memory_region_init_alias(ecam_alias, OBJECT(dev), "pcie-ecam",
+                             ecam_reg, 0, xam->cfg.pcie_ecam.size);
+    memory_region_add_subregion(get_system_memory(), xam->cfg.pcie_ecam.base,
+                                ecam_alias);
+
+    /* Map the MMIO space */
+    mmio_alias = g_new0(MemoryRegion, 1);
+    mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
+    memory_region_init_alias(mmio_alias, OBJECT(dev), "pcie-mmio",
+                             mmio_reg,
+                             xam->cfg.pcie_mmio.base,
+                             xam->cfg.pcie_mmio.size);
+    memory_region_add_subregion(get_system_memory(), xam->cfg.pcie_mmio.base,
+                                mmio_alias);
+
+    /* Map the MMIO_HIGH space */
+    mmio_alias_high = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(mmio_alias_high, OBJECT(dev), "pcie-mmio-high",
+                             mmio_reg,
+                             xam->cfg.pcie_mmio_high.base,
+                             xam->cfg.pcie_mmio_high.size);
+    memory_region_add_subregion(get_system_memory(),
+                                xam->cfg.pcie_mmio_high.base,
+                                mmio_alias_high);
+
+    /* Legacy PCI interrupts (#INTA - #INTD) */
+    for (i = 0; i < GPEX_NUM_IRQS; i++) {
+        qemu_irq irq = qemu_allocate_irq(xen_set_irq, NULL,
+                                         GUEST_VIRTIO_PCI_SPI_FIRST + i);
+
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i, irq);
+        gpex_set_irq_num(GPEX_HOST(dev), i, GUEST_VIRTIO_PCI_SPI_FIRST + i);
+    }
+}
+
 void arch_handle_ioreq(XenIOState *state, ioreq_t *req)
 {
     hw_error("Invalid ioreq type 0x%x\n", req->type);
@@ -192,6 +270,13 @@ static void xen_arm_init(MachineState *machine)
 
     xen_create_virtio_mmio_devices(xam);
 
+    if (xen_validate_pcie_config(xam)) {
+        xen_create_pcie(xam);
+    } else {
+        DPRINTF("PCIe host bridge is not configured,"
+                " only virtio-mmio can be used\n");
+    }
+
 #ifdef CONFIG_TPM
     if (xam->cfg.tpm_base_addr) {
         xen_enable_tpm(xam);
@@ -227,6 +312,150 @@ static void xen_arm_set_tpm_base_addr(Object *obj, Visitor *v,
 }
 #endif
 
+static void xen_arm_get_pcie_ecam_base_addr(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value = xam->cfg.pcie_ecam.base;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void xen_arm_set_pcie_ecam_base_addr(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+
+    xam->cfg.pcie_ecam.base = value;
+}
+
+static void xen_arm_get_pcie_ecam_size(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value = xam->cfg.pcie_ecam.size;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void xen_arm_set_pcie_ecam_size(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+
+    xam->cfg.pcie_ecam.size = value;
+}
+
+static void xen_arm_get_pcie_mmio_base_addr(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value = xam->cfg.pcie_mmio.base;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void xen_arm_set_pcie_mmio_base_addr(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+
+    xam->cfg.pcie_mmio.base = value;
+}
+
+static void xen_arm_get_pcie_mmio_size(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value = xam->cfg.pcie_mmio.size;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void xen_arm_set_pcie_mmio_size(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+
+    xam->cfg.pcie_mmio.size = value;
+}
+
+static void xen_arm_get_pcie_prefetch_base_addr(Object *obj, Visitor *v,
+                                               const char *name, void *opaque,
+                                               Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value = xam->cfg.pcie_mmio_high.base;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void xen_arm_set_pcie_prefetch_base_addr(Object *obj, Visitor *v,
+                                               const char *name, void *opaque,
+                                               Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+
+    xam->cfg.pcie_mmio_high.base = value;
+}
+
+static void xen_arm_get_pcie_prefetch_size(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value = xam->cfg.pcie_mmio_high.size;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void xen_arm_set_pcie_prefetch_size(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    XenArmState *xam = XEN_ARM(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+
+    xam->cfg.pcie_mmio_high.size = value;
+}
+
 static void xen_arm_machine_class_init(ObjectClass *oc, void *data)
 {
 
@@ -248,6 +477,48 @@ static void xen_arm_machine_class_init(ObjectClass *oc, void *data)
 
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
 #endif
+
+    object_class_property_add(oc, "pci-ecam-base-addr", "uint64_t",
+                              xen_arm_get_pcie_ecam_base_addr,
+                              xen_arm_set_pcie_ecam_base_addr,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pci-ecam-base-addr",
+                                          "Set Base address for PCI ECAM.");
+
+    object_class_property_add(oc, "pci-ecam-size", "uint64_t",
+                              xen_arm_get_pcie_ecam_size,
+                              xen_arm_set_pcie_ecam_size,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pci-ecam-size",
+                                          "Set Size for PCI ECAM.");
+
+    object_class_property_add(oc, "pci-mmio-base-addr", "uint64_t",
+                              xen_arm_get_pcie_mmio_base_addr,
+                              xen_arm_set_pcie_mmio_base_addr,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pci-mmio-base-addr",
+                                          "Set Base address for PCI MMIO.");
+
+    object_class_property_add(oc, "pci-mmio-size", "uint64_t",
+                              xen_arm_get_pcie_mmio_size,
+                              xen_arm_set_pcie_mmio_size,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pci-mmio-size",
+                                          "Set size for PCI MMIO.");
+
+    object_class_property_add(oc, "pci-prefetch-base-addr", "uint64_t",
+                              xen_arm_get_pcie_prefetch_base_addr,
+                              xen_arm_set_pcie_prefetch_base_addr,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pci-prefetch-base-addr",
+                                          "Set Prefetch Base address for PCI.");
+
+    object_class_property_add(oc, "pci-prefetch-size", "uint64_t",
+                              xen_arm_get_pcie_prefetch_size,
+                              xen_arm_set_pcie_prefetch_size,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pci-prefetch-size",
+                                          "Set Prefetch size for PCI.");
 }
 
 static const TypeInfo xen_arm_machine_type = {
